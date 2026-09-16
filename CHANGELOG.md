@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — CloudNative fork
+
+- Correct MAP bMessage byte lengths, CRLF framing, and terminator escaping.
+- Subscribe to transfer completion before submission so immediate BlueZ object
+  removal does not lose the outcome; missing evidence still reports unknown and
+  never triggers an automatic resend.
+- Log transfer failure stages and D-Bus error names without recipients or bodies.
+
 ## [0.1.0] — 2026-05-19
 
 First tagged release. Working iphonebridge daemon on Pop!_OS 24.04

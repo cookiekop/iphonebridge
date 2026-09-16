@@ -117,7 +117,7 @@ class MessagesService(dbus.service.Object):
         future.add_done_callback(lambda done: GLib.idle_add(finish, done))
 
     def _send(self, recipient: str, body: str) -> str:
-        log.info("DBus Send called for %s (%d-byte body)", recipient, len(body))
+        log.info("DBus Send called (%d-byte body)", len(body.encode("utf-8")))
         if not recipient.strip() or not body.strip():
             raise dbus.exceptions.DBusException(
                 "recipient and body must both be non-empty",

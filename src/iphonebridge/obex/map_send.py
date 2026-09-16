@@ -17,6 +17,7 @@ import logging
 import math
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -40,17 +41,10 @@ def obex(path: str, interface: str) -> dbus.Interface:
 
 
 def _byte_stuff(body: str) -> str:
-    """Apply MAP bMessage byte-stuffing.
-
-    Lines in the message body that start with `BEGIN:`, `END:`, or other
-    keywords the bMessage parser would intercept must be prefixed with a
-    single space. Conservative implementation: prefix any line starting
-    with `BEGIN:` or `END:`.
-    """
-    return "\n".join(
-        (" " + line) if line.startswith(("BEGIN:", "END:")) else line
-        for line in body.splitlines()
-    )
+    """Normalize transport newlines and escape MAP message terminators."""
+    lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return "\r\n".join("/" + line if re.match(r"/*END:MSG", line) else line
+                       for line in lines)
 
 
 def build_bmessage(recipient: str, body: str) -> str:
@@ -65,7 +59,8 @@ def build_bmessage(recipient: str, body: str) -> str:
     if not body:
         raise ValueError("Message body must not be empty")
     stuffed = _byte_stuff(body)
-    encoded_len = len(stuffed.encode("utf-8"))
+    content = f"BEGIN:MSG\r\n{stuffed}\r\nEND:MSG\r\n"
+    encoded_len = len(content.encode("utf-8"))
     lines = [
         "BEGIN:BMSG",
         "VERSION:1.0",
@@ -98,6 +93,50 @@ def build_bmessage(recipient: str, body: str) -> str:
     return "\r\n".join(lines) + "\r\n"
 
 
+class TransferWatch:
+    """Retain terminal signals even when BlueZ removes the transfer immediately."""
+
+    def __init__(self, session_path: str, bus=None) -> None:
+        if bus is None:
+            from iphonebridge.bus import session_bus
+            bus = session_bus
+        self.prefix = session_path.rstrip("/") + "/"
+        self.states: dict[str, str] = {}
+        self.condition = threading.Condition()
+        self.match = bus.add_signal_receiver(
+            self._changed, signal_name="PropertiesChanged",
+            dbus_interface="org.freedesktop.DBus.Properties", bus_name="org.bluez.obex",
+            arg0="org.bluez.obex.Transfer1", path_keyword="path")
+
+    def _changed(self, interface, changed, _invalidated, *, path: str) -> None:
+        state = str(changed.get("Status", ""))
+        if (str(interface) != "org.bluez.obex.Transfer1" or not str(path).startswith(self.prefix)
+                or state not in {"complete", "error"}):
+            return
+        with self.condition:
+            self.states.setdefault(str(path), state)
+            self.condition.notify_all()
+
+    def terminal(self, path: str, timeout: float = 0) -> str | None:
+        with self.condition:
+            if timeout > 0:
+                self.condition.wait_for(lambda: path in self.states, timeout=timeout)
+            return self.states.get(path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.match.remove()
+
+
+def _log_dbus_failure(stage: str, error: dbus.exceptions.DBusException) -> None:
+    name = error.get_dbus_name()
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,160}", name):
+        name = "unknown"
+    log.warning("MAP acknowledgement failed: stage=%s error=%s", stage, name)
+
+
 def send_message(
     session_path: str,
     recipient: str,
@@ -114,7 +153,7 @@ def send_message(
     if not math.isfinite(poll_timeout_s) or poll_timeout_s <= 0:
         raise ValueError("Transfer timeout must be positive and finite")
     bmsg = build_bmessage(recipient, body)
-    with tempfile.TemporaryDirectory(prefix="ibridge_send_") as directory:
+    with TransferWatch(session_path) as watch, tempfile.TemporaryDirectory(prefix="ibridge_send_") as directory:
         tmp = Path(directory) / "message.bmsg"
         tmp.write_text(bmsg, encoding="utf-8")
         map_iface = obex(session_path, "org.bluez.obex.MessageAccess1")
@@ -123,6 +162,7 @@ def send_message(
         try:
             ret = map_iface.PushMessage(str(tmp), folder, {}, timeout=poll_timeout_s)
         except dbus.exceptions.DBusException as e:
+            _log_dbus_failure("push", e)
             if e.get_dbus_name() in {
                 "org.bluez.obex.Error.InvalidArguments",
                 "org.bluez.obex.Error.NotAuthorized",
@@ -138,6 +178,7 @@ def send_message(
         status = str(ret[1].get("Status", "queued"))
         try:
             while True:
+                status = watch.terminal(transfer_path) or status
                 if status == "complete":
                     log.info("MAP transfer complete; carrier delivery is unconfirmed")
                     return transfer_path
@@ -150,6 +191,10 @@ def send_message(
                     tprops = obex(transfer_path, "org.freedesktop.DBus.Properties")
                     status = str(tprops.Get("org.bluez.obex.Transfer1", "Status", timeout=remaining))
                 except dbus.exceptions.DBusException as e:
+                    status = watch.terminal(transfer_path, timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+                    if status is not None:
+                        continue
+                    _log_dbus_failure("completion", e)
                     raise SendOutcomeUnknown("MAP transfer acknowledgement was lost; do not automatically resend") from e
                 if status not in ("complete", "error"):
                     time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
