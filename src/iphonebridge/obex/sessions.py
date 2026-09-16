@@ -7,8 +7,6 @@ for its lifetime, reopening only on observed failure.
 from __future__ import annotations
 
 import logging
-import subprocess
-import time
 from dataclasses import dataclass
 
 import dbus
@@ -43,20 +41,19 @@ class ObexSession:
     def properties(self) -> dbus.Interface:
         return obex(self.path, "org.freedesktop.DBus.Properties")
 
+    def is_healthy(self) -> bool:
+        try:
+            self.properties.GetAll("org.bluez.obex.Session1", timeout=2.0)
+            return True
+        except dbus.exceptions.DBusException:
+            return False
+
 
 def _client() -> dbus.Interface:
     return obex("/org/bluez/obex", "org.bluez.obex.Client1")
 
 
-def _restart_obexd() -> None:
-    """Restart user obex.service to clear stale state — see spike/RESULTS.md §2."""
-    log.info("restarting user obex.service for a clean state")
-    subprocess.run(["systemctl", "--user", "restart", "obex.service"],
-                   check=False)
-    time.sleep(1.0)
-
-
-def _create_session(target: str, *, retry_on_forbidden: bool = True) -> ObexSession:
+def _create_session(target: str) -> ObexSession:
     log.info("creating OBEX session (Target=%s) to %s", target, config.IPHONE_MAC)
     try:
         source = str(bluez(f"/org/bluez/{config.ADAPTER}", "org.freedesktop.DBus.Properties").Get(
@@ -67,11 +64,6 @@ def _create_session(target: str, *, retry_on_forbidden: bool = True) -> ObexSess
         return ObexSession(target=target, path=path)
     except dbus.exceptions.DBusException as e:
         msg = e.get_dbus_message() or ""
-        if retry_on_forbidden and ("Forbidden" in msg or "0x43" in msg):
-            log.warning("OBEX %s got Forbidden — restarting obexd and "
-                        "retrying once", target)
-            _restart_obexd()
-            return _create_session(target, retry_on_forbidden=False)
         raise SessionError(f"CreateSession({target}) failed: {e.get_dbus_name()}: {msg}")
 
 
@@ -84,22 +76,23 @@ class SessionManager:
         self.pbap: ObexSession | None = None
 
     def open_all(self) -> None:
-        # Restart obexd once at start to give us a known-clean baseline.
-        # Idempotent — even if obexd was fine, this just re-creates it.
-        _restart_obexd()
-        self.map = _create_session("MAP")
-        log.info("MAP session: %s", self.map.path)
-        if self.include_contacts:
+        # systemd owns obexd. Permission failures are retried by the daemon's
+        # timer, without invalidating live sessions or other clients' bus owners.
+        if self.map is None or not self.map.is_healthy():
+            self.map = None
+            self.map = _create_session("MAP")
+            log.info("MAP session: %s", self.map.path)
+        if self.include_contacts and (self.pbap is None or not self.pbap.is_healthy()):
+            self.pbap = None
             self.pbap = _create_session("PBAP")
             log.info("PBAP session: %s", self.pbap.path)
 
     def close_all(self) -> None:
-        client = _client()
         for sess in (self.map, self.pbap):
             if sess is None:
                 continue
             try:
-                client.RemoveSession(sess.path)
+                _client().RemoveSession(sess.path, timeout=5.0)
                 log.info("closed %s session: %s", sess.target, sess.path)
             except dbus.exceptions.DBusException as e:
                 log.debug("RemoveSession(%s): %s", sess.path, e.get_dbus_name())
@@ -108,13 +101,7 @@ class SessionManager:
 
     # Convenience accessors
     def is_healthy(self) -> bool:
-        if self.map is None:
-            return False
-        try:
-            self.map.properties.GetAll("org.bluez.obex.Session1", timeout=2.0)
-            return True
-        except dbus.exceptions.DBusException:
-            return False
+        return self.map is not None and self.map.is_healthy()
 
     @property
     def map_path(self) -> str:

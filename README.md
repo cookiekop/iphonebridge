@@ -28,6 +28,10 @@ ANCS notification collection, and PBAP contact synchronization. MAP messaging,
 HFP call control, and the D-Bus interfaces remain enabled. Existing history is
 not deleted. This mode does not implement a SIP gateway or SIP audio routing.
 
+OBEX service lifetime is managed by systemd, not by connection retries. Permission
+failures retry on the daemon's 60-second timer without restarting `obex.service`;
+healthy MAP/PBAP sessions are reused, including MAP when only PBAP was denied.
+
 Message previews are no longer written to diagnostic logs. In headless mode,
 message bodies still cross D-Bus and use temporary files for OBEX transfers;
 this is not a promise of zero disk exposure.
