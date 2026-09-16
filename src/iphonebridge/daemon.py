@@ -51,9 +51,10 @@ SESSION_RETRY_SEC = 60
 
 
 class Daemon:
-    def __init__(self) -> None:
-        self.sessions = SessionManager()
-        self.contacts = ContactsResolver()
+    def __init__(self, *, headless: bool | None = None) -> None:
+        self.headless = config.HEADLESS if headless is None else headless
+        self.sessions = SessionManager(include_contacts=not self.headless)
+        self.contacts = None if self.headless else ContactsResolver()
         self.sinks: list[Sink] = []
         self.listener: MapEventListener | None = None
         self.ancs: AncsClient | None = None
@@ -70,7 +71,7 @@ class Daemon:
         log.info("=== iphonebridge starting ===")
         config.ensure_dirs()
 
-        if not bluez_setup.prepare():
+        if not bluez_setup.prepare(allow_sudo=not self.headless):
             log.warning(
                 "bluez_setup.prepare reported issues — continuing anyway, "
                 "but MAP/PBAP may be refused. Re-pair on iPhone after the "
@@ -82,18 +83,19 @@ class Daemon:
         # BLE link to the iPhone (we don't yet do the LastUsedBearer=le
         # dance). Either way, the client just waits patiently for the three
         # ANCS characteristics to appear and subscribes when they do.
-        device_path = (
-            f"/org/bluez/{config.ADAPTER}"
-            f"/dev_{config.IPHONE_MAC.replace(':', '_')}"
-        )
-        self.ancs = AncsClient(device_path, on_event=self._fanout_ancs)
-        self.ancs.start()
+        if not self.headless:
+            device_path = (
+                f"/org/bluez/{config.ADAPTER}"
+                f"/dev_{config.IPHONE_MAC.replace(':', '_')}"
+            )
+            self.ancs = AncsClient(device_path, on_event=self._fanout_ancs)
+            self.ancs.start()
 
         # HFP — take/place calls via oFono. Also independent of MAP/PBAP; if
         # oFono isn't set up it logs a hint and stays dormant.
         self.hfp = HfpManager(
             on_event=self._fanout_call,
-            resolve_contact=lambda raw: self.contacts.resolve(raw),
+            resolve_contact=self._resolve_contact,
         )
         self.hfp.start()
 
@@ -142,7 +144,8 @@ class Daemon:
                 log.warning("  → On the iPhone:")
                 log.warning("       Settings → Bluetooth → tap (i) next to this device")
                 log.warning("       Enable: Show Message Notifications")
-                log.warning("       Enable: Sync Contacts")
+                if not self.headless:
+                    log.warning("       Enable: Sync Contacts")
                 log.warning("")
             if first_attempt and self._session_retry_id is None:
                 self._session_retry_id = GLib.timeout_add_seconds(
@@ -156,6 +159,8 @@ class Daemon:
 
     def _retry_sessions(self) -> bool:
         """GLib timer callback. Return True to keep the timer firing."""
+        if self.hfp and self.hfp.list_calls():
+            return True
         log.info("retrying MAP/PBAP session open ...")
         try:
             self.sessions.open_all()
@@ -173,6 +178,9 @@ class Daemon:
     def _setup_sinks(self) -> None:
         """Register the JSONL + libnotify sinks. Independent of the OBEX
         sessions, so ANCS/HFP events reach the desktop even in degraded mode."""
+        if self.headless:
+            log.info("Headless mode: desktop, clipboard, and message-history sinks disabled")
+            return
         if self.sinks:
             return
         self.sinks.append(JsonlSink())
@@ -194,12 +202,12 @@ class Daemon:
         self._post_sessions_done = True
 
         # Warm contacts; if empty, do a one-time pull. PBAP pull is cheap.
-        if self.contacts.count() == 0:
+        if self.contacts is not None and self.contacts.count() == 0:
             log.info("contacts cache empty — pulling from iPhone via PBAP")
             self._refresh_contacts()
 
         # Schedule periodic contacts refresh
-        if self._contacts_refresh_id is None:
+        if self.contacts is not None and self._contacts_refresh_id is None:
             self._contacts_refresh_id = GLib.timeout_add_seconds(
                 CONTACTS_REFRESH_SEC, self._periodic_refresh_contacts
             )
@@ -211,16 +219,18 @@ class Daemon:
             self.listener = MapEventListener(
                 sessions=self.sessions,
                 on_sms=self._fanout,
-                resolve_contact=lambda raw: self.contacts.resolve(raw),
+                resolve_contact=self._resolve_contact,
             )
             self.listener.start()
 
         log.info("=== iphonebridge ready (contacts=%d, sinks=%s) ===",
-                 self.contacts.count(),
+                 self.contacts.count() if self.contacts is not None else 0,
                  [s.name for s in self.sinks])
 
     def _refresh_contacts(self) -> None:
         """Pull phonebook from iPhone + reload in-process cache. Idempotent."""
+        if self.contacts is None:
+            return
         try:
             pulled = pull_phonebook(self.sessions)
             count = self.contacts.refresh()
@@ -263,13 +273,15 @@ class Daemon:
 
     # ---- internals -------------------------------------------------------
 
+    def _resolve_contact(self, raw: str | None) -> str | None:
+        return self.contacts.resolve(raw) if self.contacts is not None else None
+
     def _fanout(self, event: SmsEvent) -> None:
         for sink in self.sinks:
             try:
                 sink.handle(event)
             except Exception:
-                log.exception("sink %s failed on event %s",
-                              sink.name, event.handle)
+                log.error("sink %s failed on message event", sink.name)
         if self._dbus_service is not None:
             self._dbus_service.emit_message(event)
 
@@ -278,10 +290,10 @@ class Daemon:
         shows up in conversation history alongside incoming messages."""
         event = sms_sent_event(
             recipient, body,
-            contact_name=self.contacts.resolve(recipient),
+            contact_name=self._resolve_contact(recipient),
             transfer_path=transfer_path,
         )
-        log.info("sms_sent to %s: %r", event.display_sender, (body or "")[:80])
+        log.info("Message transferred to phone (%d bytes); carrier delivery unconfirmed", len(body.encode("utf-8")))
         self._fanout(event)
 
     def _fanout_ancs(self, event: AncsEvent) -> None:

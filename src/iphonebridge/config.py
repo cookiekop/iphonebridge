@@ -37,6 +37,8 @@ def _load_local_env() -> None:
 
 _load_local_env()
 
+HEADLESS: bool = os.environ.get("IPHONEBRIDGE_HEADLESS", "0").lower() in {"1", "true", "yes", "on"}
+
 
 # ---- target device ------------------------------------------------------
 

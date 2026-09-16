@@ -15,7 +15,7 @@ import dbus
 import dbus.exceptions
 
 from iphonebridge import config
-from iphonebridge.bus import obex
+from iphonebridge.bus import obex, bluez
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +59,10 @@ def _restart_obexd() -> None:
 def _create_session(target: str, *, retry_on_forbidden: bool = True) -> ObexSession:
     log.info("creating OBEX session (Target=%s) to %s", target, config.IPHONE_MAC)
     try:
+        source = str(bluez(f"/org/bluez/{config.ADAPTER}", "org.freedesktop.DBus.Properties").Get(
+            "org.bluez.Adapter1", "Address"))
         path = str(_client().CreateSession(
-            config.IPHONE_MAC, {"Target": target}, timeout=30.0
+            config.IPHONE_MAC, {"Target": target, "Source": source}, timeout=30.0
         ))
         return ObexSession(target=target, path=path)
     except dbus.exceptions.DBusException as e:
@@ -76,7 +78,8 @@ def _create_session(target: str, *, retry_on_forbidden: bool = True) -> ObexSess
 class SessionManager:
     """Opens and tracks one MAP and one PBAP session for the daemon lifetime."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, include_contacts: bool = True) -> None:
+        self.include_contacts = include_contacts
         self.map: ObexSession | None = None
         self.pbap: ObexSession | None = None
 
@@ -86,8 +89,9 @@ class SessionManager:
         _restart_obexd()
         self.map = _create_session("MAP")
         log.info("MAP session: %s", self.map.path)
-        self.pbap = _create_session("PBAP")
-        log.info("PBAP session: %s", self.pbap.path)
+        if self.include_contacts:
+            self.pbap = _create_session("PBAP")
+            log.info("PBAP session: %s", self.pbap.path)
 
     def close_all(self) -> None:
         client = _client()
@@ -103,6 +107,15 @@ class SessionManager:
         self.pbap = None
 
     # Convenience accessors
+    def is_healthy(self) -> bool:
+        if self.map is None:
+            return False
+        try:
+            self.map.properties.GetAll("org.bluez.obex.Session1", timeout=2.0)
+            return True
+        except dbus.exceptions.DBusException:
+            return False
+
     @property
     def map_path(self) -> str:
         if self.map is None:

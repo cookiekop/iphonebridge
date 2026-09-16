@@ -14,6 +14,8 @@ just passes its path here.
 from __future__ import annotations
 
 import logging
+import math
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -21,9 +23,20 @@ from pathlib import Path
 import dbus
 import dbus.exceptions
 
-from iphonebridge.bus import obex
-
 log = logging.getLogger(__name__)
+
+
+class SendFailed(RuntimeError):
+    """The phone transfer was explicitly rejected or failed."""
+
+
+class SendOutcomeUnknown(RuntimeError):
+    """The phone may have accepted the message; do not resend automatically."""
+
+
+def obex(path: str, interface: str) -> dbus.Interface:
+    from iphonebridge.bus import obex as get_interface
+    return get_interface(path, interface)
 
 
 def _byte_stuff(body: str) -> str:
@@ -47,6 +60,10 @@ def build_bmessage(recipient: str, body: str) -> str:
       • Originator VCARD (empty for outgoing — iPhone fills in)
       • BENV → recipient VCARD + BBODY → MSG body
     """
+    if re.fullmatch(r"\+?[0-9]{1,80}", recipient) is None:
+        raise ValueError("Recipient must be digits with an optional leading +")
+    if not body:
+        raise ValueError("Message body must not be empty")
     stuffed = _byte_stuff(body)
     encoded_len = len(stuffed.encode("utf-8"))
     lines = [
@@ -91,45 +108,55 @@ def send_message(
 ) -> str:
     """Push a message via the given MAP session.
 
-    Returns the BlueZ transfer object path once status reaches 'complete'
-    or 'gone'. Raises on InvalidArguments or transfer error.
+    Return only after confirmed transfer completion, not carrier delivery.
+    Timeout or lost acknowledgement raises SendOutcomeUnknown, never success.
     """
+    if not math.isfinite(poll_timeout_s) or poll_timeout_s <= 0:
+        raise ValueError("Transfer timeout must be positive and finite")
     bmsg = build_bmessage(recipient, body)
-    tmp = Path(tempfile.mkstemp(prefix="ibridge_send_", suffix=".bmsg")[1])
-    tmp.write_text(bmsg, encoding="utf-8")
-    try:
+    with tempfile.TemporaryDirectory(prefix="ibridge_send_") as directory:
+        tmp = Path(directory) / "message.bmsg"
+        tmp.write_text(bmsg, encoding="utf-8")
         map_iface = obex(session_path, "org.bluez.obex.MessageAccess1")
-        log.info("PushMessage → %s (%d bytes body, folder=%s)",
-                 recipient, len(body), folder)
+        deadline = time.monotonic() + poll_timeout_s
+        log.info("Submitting MAP transfer (%d bytes)", len(body.encode("utf-8")))
         try:
-            ret = map_iface.PushMessage(str(tmp), folder, {})
+            ret = map_iface.PushMessage(str(tmp), folder, {}, timeout=poll_timeout_s)
         except dbus.exceptions.DBusException as e:
-            raise RuntimeError(
-                f"PushMessage rejected: {e.get_dbus_name()}: "
-                f"{e.get_dbus_message() or '(no message)'}"
-            ) from e
-        transfer_path = str(ret[0]) if isinstance(ret, (tuple, list)) else str(ret)
-        log.info("transfer: %s", transfer_path)
+            if e.get_dbus_name() in {
+                "org.bluez.obex.Error.InvalidArguments",
+                "org.bluez.obex.Error.NotAuthorized",
+                "org.bluez.obex.Error.Forbidden",
+                "org.bluez.obex.Error.NotSupported",
+            }:
+                raise SendFailed("MAP submission was rejected") from e
+            raise SendOutcomeUnknown("MAP submission was not acknowledged; do not automatically resend") from e
 
-        # Poll transfer to completion
-        tprops = obex(transfer_path, "org.freedesktop.DBus.Properties")
-        deadline = time.time() + poll_timeout_s
-        status: str | None = None
-        while time.time() < deadline:
-            try:
-                status = str(tprops.Get("org.bluez.obex.Transfer1", "Status"))
-            except dbus.exceptions.DBusException:
-                status = "gone"
-                break
-            if status in ("complete", "error"):
-                break
-            time.sleep(0.1)
-        log.info("send result: status=%s", status)
-        if status == "error":
-            raise RuntimeError(f"Transfer reported error: {transfer_path}")
-        return transfer_path
-    finally:
+        if not isinstance(ret, (tuple, list)) or len(ret) != 2 or not isinstance(ret[1], dict):
+            raise SendOutcomeUnknown("Invalid MAP acknowledgement; do not automatically resend")
+        transfer_path = str(ret[0])
+        status = str(ret[1].get("Status", "queued"))
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+            while True:
+                if status == "complete":
+                    log.info("MAP transfer complete; carrier delivery is unconfirmed")
+                    return transfer_path
+                if status == "error":
+                    raise SendFailed("MAP transfer reported an error")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SendOutcomeUnknown("MAP transfer timed out; do not automatically resend")
+                try:
+                    tprops = obex(transfer_path, "org.freedesktop.DBus.Properties")
+                    status = str(tprops.Get("org.bluez.obex.Transfer1", "Status", timeout=remaining))
+                except dbus.exceptions.DBusException as e:
+                    raise SendOutcomeUnknown("MAP transfer acknowledgement was lost; do not automatically resend") from e
+                if status not in ("complete", "error"):
+                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        except SendOutcomeUnknown:
+            # Cancellation cannot prove that a carrier send did not already occur.
+            try:
+                obex(transfer_path, "org.bluez.obex.Transfer1").Cancel(timeout=1.0)
+            except dbus.exceptions.DBusException:
+                pass
+            raise

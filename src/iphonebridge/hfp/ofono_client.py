@@ -21,6 +21,7 @@ spike/05b_hfp_ofono.py and spike/RESULTS.md (HFP addendum).
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -29,6 +30,7 @@ import dbus
 import dbus.exceptions
 
 from iphonebridge.bus import system_bus
+from iphonebridge import config
 from iphonebridge.hfp.events import CallEvent, call_event_from_ofono
 
 log = logging.getLogger(__name__)
@@ -157,6 +159,9 @@ class HfpManager:
         props = dict(props)
         if str(props.get("Type", "")) != "hfp":
             return
+        expected = f"/hfp/org/bluez/{config.ADAPTER}/dev_{config.IPHONE_MAC.replace(':', '_')}"
+        if str(path).lower() != expected.lower():
+            return
         if self._modem_path is not None:
             return  # we track a single iPhone modem
         self._modem_path = str(path)
@@ -184,7 +189,13 @@ class HfpManager:
         try:
             modem = dbus.Interface(
                 system_bus.get_object(OFONO, self._modem_path), _MODEM_IFACE)
-            self._maybe_hook_vcm(dict(modem.GetProperties()))
+            props = dict(modem.GetProperties())
+            if self._vcm_hooked and (_VCM_IFACE not in props.get("Interfaces", []) or not props.get("Powered")):
+                path = self._modem_path
+                self._on_modem_removed(path)
+                self._on_modem_added(path, props)
+            else:
+                self._maybe_hook_vcm(props)
         except dbus.exceptions.DBusException:
             pass
 
@@ -328,11 +339,27 @@ class HfpManager:
     def dial(self, number: str) -> str:
         """Place a call. Returns the new oFono VoiceCall object path."""
         self._require_modem()
+        if not re.fullmatch(r"\+?[0-9]{1,80}", number):
+            raise ValueError("Invalid dialled number")
+        if self._calls:
+            raise HfpError("Phone already has a call")
         vcm = dbus.Interface(
             system_bus.get_object(OFONO, self._modem_path), _VCM_IFACE)
         return str(vcm.Dial(number, ""))
 
+    @property
+    def ready(self) -> bool:
+        return bool(self._modem_path and self._vcm_hooked)
+
+    def send_tones(self, tones: str) -> None:
+        self._require_modem()
+        if not re.fullmatch(r"[0-9*#ABCD]{1,32}", tones):
+            raise ValueError("Invalid DTMF tones")
+        dbus.Interface(system_bus.get_object(OFONO, self._modem_path), _VCM_IFACE).SendTones(tones)
+
     def _voicecall(self, call_path: str) -> dbus.Interface:
+        if call_path not in self._calls:
+            raise HfpError("Call does not belong to the configured phone")
         return dbus.Interface(
             system_bus.get_object(OFONO, call_path), _VC_IFACE)
 

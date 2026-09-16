@@ -14,6 +14,31 @@
 
 </div>
 
+## CloudNative fork
+
+The headless D-Bus interface also exposes `Calls1.GetStatus` and `SendTones`.
+Call control is restricted to `IPHONEBRIDGE_MAC` on `IPHONEBRIDGE_ADAPTER`.
+`Messages1.Send` replies asynchronously so a MAP transfer does not block call
+events; a completed reply still means phone transfer, not carrier delivery.
+MAP downloads check already-completed transfers and have a bounded timeout.
+
+For a headless gateway, set `IPHONEBRIDGE_HEADLESS=1` before running the daemon.
+This disables desktop notifications, clipboard access, JSONL message history,
+ANCS notification collection, and PBAP contact synchronization. MAP messaging,
+HFP call control, and the D-Bus interfaces remain enabled. Existing history is
+not deleted. This mode does not implement a SIP gateway or SIP audio routing.
+
+Message previews are no longer written to diagnostic logs. In headless mode,
+message bodies still cross D-Bus and use temporary files for OBEX transfers;
+this is not a promise of zero disk exposure.
+
+`Send` succeeds only after confirmed MAP transfer completion. This confirms a
+transfer to the phone, not carrier delivery. A missing acknowledgement,
+disappeared transfer, or timeout returns
+`com.gabriel.iphonebridge.Error.SendOutcomeUnknown`. Do not automatically resend
+an unknown-outcome message: the phone might already have submitted it. The
+`MessageSent` event likewise means phone transfer, not confirmed delivery.
+
 ---
 
 Microsoft's **Phone Link** gives Windows users their iPhone's texts and notifications on the desktop. There has never been a Linux equivalent — KDE Connect needs the Android/iOS *app* and only does Wi-Fi, `ancs4linux` does notifications only, Mac-relay bridges (BlueBubbles, AirMessage) need an actual Mac, and Beeper costs money.

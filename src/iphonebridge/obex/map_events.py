@@ -16,11 +16,13 @@ Flow:
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
 import dbus
+from gi.repository import GLib
 
 from iphonebridge.bus import obex, session_bus
 from iphonebridge.events import SmsEvent, normalize_phone, parse_map_timestamp
@@ -84,6 +86,12 @@ class MapEventListener:
             return
 
         props = dict(ifaces["org.bluez.obex.Message1"])
+        folder = str(props.get("Folder", "")).lower()
+        if folder and not folder.endswith("/inbox"):
+            return
+        if len(self._pending) >= 128:
+            log.error("Too many pending MAP downloads")
+            return
         handle = path_s.rsplit("/", 1)[-1]
         log.info("new Message1 at %s (Status=%s Type=%s Size=%s) — fetching body",
                  handle, props.get("Status"), props.get("Type"),
@@ -92,7 +100,9 @@ class MapEventListener:
         # Kick off the bMessage download. We do this via the per-message
         # Message1.Get method, which returns a transfer object. We'll wait
         # for Status=complete via PropertyChanged on that transfer.
-        target = Path(tempfile.mkstemp(prefix="ibridge_msg_", suffix=".bmsg")[1])
+        descriptor, filename = tempfile.mkstemp(prefix="ibridge_msg_", suffix=".bmsg")
+        os.close(descriptor)
+        target = Path(filename)
         try:
             msg_iface = obex(path_s, "org.bluez.obex.Message1")
             ret = msg_iface.Get(str(target), False)
@@ -112,7 +122,8 @@ class MapEventListener:
             initial_props=props,
         )
         self._pending[transfer_path] = pending
-        pending.subscribe()
+        initial_transfer = dict(ret[1]) if isinstance(ret, (tuple, list)) and len(ret) == 2 else {}
+        pending.subscribe(initial_transfer)
 
 
 # ---- per-transfer state machine ----------------------------------------
@@ -136,16 +147,44 @@ class _PendingFetch:
         self.target = target
         self.initial_props = initial_props
         self._match = None
+        self._timeout = None
+        self._finished = False
 
-    def subscribe(self) -> None:
+    def subscribe(self, initial_transfer: dict) -> None:
         self._match = session_bus.add_signal_receiver(
             self._on_props_changed,
             dbus_interface="org.freedesktop.DBus.Properties",
             signal_name="PropertiesChanged",
             path=self.transfer_path,
         )
+        self._timeout = GLib.timeout_add_seconds(35, self._expired)
+        if initial_transfer.get("Status") in ("complete", "error"):
+            self._on_props_changed("org.bluez.obex.Transfer1", initial_transfer, [])
+            return
+        # Cover completion between Get() and subscription installation.
+        try:
+            props = obex(self.transfer_path, "org.freedesktop.DBus.Properties").GetAll(
+                "org.bluez.obex.Transfer1", timeout=2.0)
+            self._on_props_changed("org.bluez.obex.Transfer1", props, [])
+        except dbus.exceptions.DBusException:
+            log.warning("MAP download disappeared before completion could be confirmed")
+
+    def _expired(self) -> bool:
+        self._timeout = None
+        log.warning("MAP download timed out")
+        try:
+            obex(self.transfer_path, "org.bluez.obex.Transfer1").Cancel(timeout=1.0)
+        except dbus.exceptions.DBusException:
+            pass
+        self.cleanup()
+        self.listener._pending.pop(self.transfer_path, None)
+        return False
 
     def cleanup(self) -> None:
+        self._finished = True
+        if self._timeout is not None:
+            GLib.source_remove(self._timeout)
+            self._timeout = None
         if self._match is not None:
             try:
                 self._match.remove()
@@ -160,6 +199,8 @@ class _PendingFetch:
     # ---- the actual handler ---------------------------------------------
 
     def _on_props_changed(self, iface, changed, _invalidated):
+        if self._finished:
+            return
         if iface != "org.bluez.obex.Transfer1":
             return
         status = changed.get("Status")
@@ -183,6 +224,8 @@ class _PendingFetch:
 
             blob = self.target.read_text(errors="replace")
             parsed = parse_bmessage(blob)
+            if parsed.folder and not parsed.folder.lower().endswith("/inbox"):
+                return
             self._fire_full(parsed)
         finally:
             self.cleanup()
@@ -211,12 +254,11 @@ class _PendingFetch:
             raw_type=parsed.type or str(self.initial_props.get("Type") or "") or None,
             message_path=self.message_path,
         )
-        log.info("sms_received from %s: %r",
-                 event.display_sender, (event.body or "")[:80])
+        log.info("MAP message received (%d bytes)", len((event.body or "").encode("utf-8")))
         try:
             self.listener.on_sms(event)
         except Exception:
-            log.exception("on_sms callback raised")
+            log.error("on_sms callback raised")
 
     def _fire_minimal(self) -> None:
         """Fallback: fire what little we know, so a notification still shows."""
@@ -236,4 +278,4 @@ class _PendingFetch:
         try:
             self.listener.on_sms(event)
         except Exception:
-            log.exception("on_sms callback raised")
+            log.error("on_sms callback raised")

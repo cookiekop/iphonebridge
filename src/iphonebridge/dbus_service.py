@@ -26,22 +26,23 @@ Events1 (live event feed for separate UIs):
   • MessageSeen(dict)       [signal] — a message's read-state changed
   • AncsNotification(dict)  [signal] — a per-app ANCS notification
 
-Designed to be simple/synchronous. PushMessage typically completes in
-<2s on iOS 26.5 over the existing daemon session.
+Send completes asynchronously so MAP transfer polling cannot block call events.
 """
 from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import dbus
 import dbus.exceptions
 import dbus.service
+from gi.repository import GLib
 
 from iphonebridge.bus import session_bus
 from iphonebridge.hfp.ofono_client import HfpError, HfpManager
 from iphonebridge.obex.map_query import list_recent_messages
-from iphonebridge.obex.map_send import send_message
+from iphonebridge.obex.map_send import SendFailed, SendOutcomeUnknown, send_message
 from iphonebridge.obex.sessions import SessionManager
 
 log = logging.getLogger(__name__)
@@ -84,11 +85,38 @@ class MessagesService(dbus.service.Object):
         # on_sent(recipient, body, transfer_path) — daemon hook to record a
         # message we just sent (logs it to history + the event feed).
         self._on_sent = on_sent
+        self._sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="map-send")
+        self._sending = False
 
     # ---- Messages1 ------------------------------------------------------
 
-    @dbus.service.method(IFACE, in_signature="ss", out_signature="s")
-    def Send(self, recipient: str, body: str) -> str:
+    @dbus.service.method(IFACE, in_signature="ss", out_signature="s", async_callbacks=("reply", "error"))
+    def Send(self, recipient: str, body: str, reply, error) -> None:
+        if self._sending:
+            error(dbus.exceptions.DBusException("A message transfer is in progress",
+                                               name="com.gabriel.iphonebridge.Error.NotReady"))
+            return
+        self._sending = True
+
+        def finish(future) -> bool:
+            self._sending = False
+            try:
+                transfer = future.result()
+            except Exception as exception:
+                error(exception)
+                return False
+            if self._on_sent is not None:
+                try:
+                    self._on_sent(recipient, body, transfer)
+                except Exception:
+                    log.error("Message event failed after phone transfer")
+            reply(transfer)
+            return False
+
+        future = self._sender.submit(self._send, str(recipient), str(body))
+        future.add_done_callback(lambda done: GLib.idle_add(finish, done))
+
+    def _send(self, recipient: str, body: str) -> str:
         log.info("DBus Send called for %s (%d-byte body)", recipient, len(body))
         if not recipient.strip() or not body.strip():
             raise dbus.exceptions.DBusException(
@@ -102,18 +130,27 @@ class MessagesService(dbus.service.Object):
             )
         try:
             transfer = send_message(self.sessions.map_path, recipient, body)
-        except Exception as e:
-            log.exception("Send failed")
+        except SendOutcomeUnknown:
+            log.warning("MAP send outcome is unknown")
             raise dbus.exceptions.DBusException(
-                str(e), name="com.gabriel.iphonebridge.Error.SendFailed"
-            )
-        # Record the sent message (history + event feed). Never let a logging
-        # failure fail the send — the message already went out.
-        if self._on_sent is not None:
-            try:
-                self._on_sent(recipient, body, transfer)
-            except Exception:
-                log.exception("on_sent hook failed (message was still sent)")
+                "Phone submission is unconfirmed; do not automatically resend",
+                name="com.gabriel.iphonebridge.Error.SendOutcomeUnknown",
+            ) from None
+        except ValueError:
+            raise dbus.exceptions.DBusException(
+                "Invalid message recipient or body",
+                name="com.gabriel.iphonebridge.Error.InvalidArgs",
+            ) from None
+        except SendFailed:
+            raise dbus.exceptions.DBusException(
+                "Phone transfer failed", name="com.gabriel.iphonebridge.Error.SendFailed"
+            ) from None
+        except Exception as e:
+            log.error("MAP send failed (%s)", type(e).__name__)
+            raise dbus.exceptions.DBusException(
+                "Phone submission could not be confirmed",
+                name="com.gabriel.iphonebridge.Error.SendOutcomeUnknown"
+            ) from None
         return transfer
 
     @dbus.service.method(IFACE, in_signature="su", out_signature="s")
@@ -138,7 +175,21 @@ class MessagesService(dbus.service.Object):
 
     @dbus.service.method(IFACE, in_signature="", out_signature="b")
     def IsHealthy(self) -> bool:
-        return self.sessions.map is not None
+        return self.sessions.is_healthy()
+
+    @dbus.service.method(CALLS_IFACE, in_signature="", out_signature="s")
+    def GetStatus(self) -> str:
+        return json.dumps({"messages_ready": self.sessions.is_healthy(),
+                           "calls_ready": bool(self.hfp and self.hfp.ready),
+                           "calls": self.hfp.list_calls() if self.hfp else []})
+
+    @dbus.service.method(CALLS_IFACE, in_signature="s", out_signature="")
+    def SendTones(self, tones: str) -> None:
+        try:
+            self._require_hfp().send_tones(tones)
+        except Exception:
+            raise dbus.exceptions.DBusException("Phone rejected DTMF",
+                                                name="com.gabriel.iphonebridge.Error.CallFailed") from None
 
     # ---- Calls1 (HFP) ---------------------------------------------------
 
